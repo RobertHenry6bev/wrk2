@@ -4,6 +4,7 @@
 #include "config.h"
 #include <pthread.h>
 #include <inttypes.h>
+#include <stddef.h>
 #include <sys/types.h>
 #include <netdb.h>
 #include <sys/socket.h>
@@ -24,6 +25,7 @@
 #define SOCKET_TIMEOUT_MS   2000
 #define CALIBRATE_DELAY_MS  10000
 #define TIMEOUT_INTERVAL_MS 2000
+#define DUMP_INTERVAL_MS   1000
 
 typedef struct {
     pthread_t thread;

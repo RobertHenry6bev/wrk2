@@ -1,5 +1,12 @@
 // Copyright (C) 2012 - Will Glozer.  All rights reserved.
 
+#include <assert.h>
+#include <inttypes.h>
+#include <stddef.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+
 #include "wrk.h"
 #include "script.h"
 #include "main.h"
@@ -25,6 +32,14 @@ static struct config {
     char    *script;
     SSL_CTX *ctx;
 } cfg;
+
+typedef struct {
+    uint64_t now;
+    uint64_t delta_requests;
+} spot_observation;
+static spot_observation *spot_observations = NULL;
+static size_t num_spot_observations = 0;
+static size_t n_spot_observations = 0;
 
 static struct {
     stats *requests;
@@ -83,6 +98,11 @@ int main(int argc, char **argv) {
         exit(1);
     }
 
+    fprintf(stdout, "##ChildProcessId:%d\n", getpid());  // For consumption by crank > 01Jan2024
+    fflush(stdout);
+    fprintf(stderr, "##ChildProcessId:%d\n", getpid());  // For consumption by crank > 01Jan2024 (preferred?)
+    fflush(stderr);
+
     char *schema  = copy_url_part(url, &parts, UF_SCHEMA);
     char *host    = copy_url_part(url, &parts, UF_HOST);
     char *port    = copy_url_part(url, &parts, UF_PORT);
@@ -108,7 +128,7 @@ int main(int argc, char **argv) {
 
     pthread_mutex_init(&statistics.mutex, NULL);
     statistics.requests = stats_alloc(10);
-    thread *threads = zcalloc(cfg.threads * sizeof(thread));
+    thread *threads = zcalloc((cfg.threads + 1) * sizeof(thread));
 
     hdr_init(1, MAX_LATENCY, 3, &(statistics.requests->histogram));
 
@@ -119,12 +139,20 @@ int main(int argc, char **argv) {
         fprintf(stderr, "unable to connect to %s:%s %s\n", host, service, msg);
         exit(1);
     }
+
+    num_spot_observations = 0
+      + ((CALIBRATE_DELAY_MS + (cfg.connections * 5)) / DUMP_INTERVAL_MS)
+      + ((TIMEOUT_INTERVAL_MS + (cfg.connections * 5)) / DUMP_INTERVAL_MS)
+      + 2*(((uint64_t)cfg.duration * 1000) / DUMP_INTERVAL_MS)
+      + 5;
+    spot_observations = (spot_observation *)zcalloc(num_spot_observations * sizeof(spot_observation));
+    n_spot_observations = 0;
     
     uint64_t connections = cfg.connections / cfg.threads;
     double throughput    = (double)cfg.rate / cfg.threads;
-    uint64_t stop_at     = time_us() + (cfg.duration * 1000000);
+    uint64_t stop_at     = time_us() + (cfg.duration * 1*1000*1000);
 
-    for (uint64_t i = 0; i < cfg.threads; i++) {
+    for (uint64_t i = 0; i < (cfg.threads + 1); i++) {
         thread *t = &threads[i];
         t->loop        = aeCreateEventLoop(10 + cfg.connections * 3);
         t->connections = connections;
@@ -144,7 +172,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        if (!t->loop || pthread_create(&t->thread, NULL, &thread_main, t)) {
+        if (!t->loop || pthread_create(&t->thread, NULL, (i < cfg.threads) ? &thread_main : &thread_per_second, t)) {
             char *msg = strerror(errno);
             fprintf(stderr, "unable to create thread %"PRIu64": %s\n", i, msg);
             exit(2);
@@ -173,14 +201,14 @@ int main(int argc, char **argv) {
     struct hdr_histogram* u_latency_histogram;
     hdr_init(1, MAX_LATENCY, 3, &u_latency_histogram);
 
-    for (uint64_t i = 0; i < cfg.threads; i++) {
+    for (uint64_t i = 0; i < (cfg.threads + 1); i++) {
         thread *t = &threads[i];
         pthread_join(t->thread, NULL);
     }
 
     uint64_t runtime_us = time_us() - start;
 
-    for (uint64_t i = 0; i < cfg.threads; i++) {
+    for (uint64_t i = 0; i < (cfg.threads + 0); i++) {
         thread *t = &threads[i];
         complete += t->complete;
         bytes    += t->bytes;
@@ -283,8 +311,8 @@ void *thread_main(void *arg) {
     uint64_t calibrate_delay = CALIBRATE_DELAY_MS + (thread->connections * 5);
     uint64_t timeout_delay = TIMEOUT_INTERVAL_MS + (thread->connections * 5);
 
-    aeCreateTimeEvent(loop, calibrate_delay, calibrate, thread, NULL);
-    aeCreateTimeEvent(loop, timeout_delay, check_timeouts, thread, NULL);
+    aeCreateTimeEvent(loop, calibrate_delay, calibrate, thread, NULL);  // chains to sample_rate
+    aeCreateTimeEvent(loop, timeout_delay, check_timeouts, thread, NULL);  // runs itself forever
 
     thread->start = time_us();
     aeMain(loop);
@@ -293,6 +321,63 @@ void *thread_main(void *arg) {
     zfree(thread->cs);
 
     return NULL;
+}
+
+void *thread_per_second(void *arg) {
+    thread *thread = arg;
+
+    char *request = NULL;
+    size_t length = 0;
+
+    if (!cfg.dynamic) {
+        script_request(thread->L, &request, &length);
+    }
+
+    thread->cs = zcalloc(thread->connections * sizeof(connection));
+
+    aeEventLoop *loop = thread->loop;
+    aeCreateTimeEvent(loop, DUMP_INTERVAL_MS, record_per_second, thread, NULL);
+
+    thread->start = time_us();
+    aeMain(loop);
+
+    aeDeleteEventLoop(loop);
+    zfree(thread->cs);
+
+    return NULL;
+}
+
+static uint64_t requests_overall = 0;  // target of a synchronized +=
+static uint64_t last_requests_overall = 0;  // only one reader/writer
+
+static int record_per_second(aeEventLoop *loop, long long id, void *data) {
+    thread *thread = data;
+    uint64_t now = time_us();
+    uint64_t million = 1 * 1000 * 1000;
+    uint64_t sample_requests_overall = requests_overall;
+    uint64_t delta_requests_overall = sample_requests_overall - last_requests_overall;
+    last_requests_overall = sample_requests_overall;
+
+    if (0) {
+        fprintf(stdout, "n_spot_observations=%d num_spot_observations=%d\n",
+            n_spot_observations, num_spot_observations);
+    }
+    assert(n_spot_observations < num_spot_observations);
+    spot_observation *p = &spot_observations[n_spot_observations];
+    n_spot_observations += 1;
+
+    p->now = now;
+    p->delta_requests = delta_requests_overall;
+
+    fprintf(stdout,
+        "RPS at Time: %" PRId64 ".%06" PRIu64 " %10" PRIu64 "\n",
+        now/million, now%million, delta_requests_overall);
+    fflush(stdout);
+
+    if (stop || now >= thread->stop_at) {
+      aeStop(loop);
+    }
+    return DUMP_INTERVAL_MS;
 }
 
 static int connect_socket(thread *thread, connection *c) {
@@ -390,17 +475,18 @@ static int check_timeouts(aeEventLoop *loop, long long id, void *data) {
 
 static int sample_rate(aeEventLoop *loop, long long id, void *data) {
     thread *thread = data;
-
+    uint64_t now   = time_us();
+    __sync_fetch_and_add(&requests_overall, thread->requests);
     uint64_t elapsed_ms = (time_us() - thread->start) / 1000;
     uint64_t requests = (thread->requests / (double) elapsed_ms) * 1000;
-
     pthread_mutex_lock(&statistics.mutex);
     stats_record(statistics.requests, requests);
     pthread_mutex_unlock(&statistics.mutex);
-
     thread->requests = 0;
-    thread->start    = time_us();
-
+    thread->start = time_us();
+    if (stop || now >= thread->stop_at) {
+        aeStop(loop);
+    }
     return thread->interval;
 }
 
