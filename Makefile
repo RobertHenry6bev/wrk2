@@ -1,4 +1,12 @@
-CFLAGS  := -std=c99 -Wall -O2 -D_REENTRANT
+SAN = -fsanitize=address
+SAN = -fsanitize=thread
+SAN = -fsanitize=undefined
+SAN =
+
+OPT = -O0 -ggdb
+OPT = -O2 -ggdb
+
+CFLAGS  := -std=c99 -Wall $(OPT) -D_REENTRANT $(SAN)
 LIBS    := -lpthread -lm -lcrypto -lssl
 
 TARGET  := $(shell uname -s | tr '[A-Z]' '[a-z]' 2>/dev/null || echo unknown)
@@ -42,7 +50,7 @@ clean:
 
 $(BIN): $(OBJ)
 	@echo LINK $(BIN)
-	@$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
+	@$(CC) $(LDFLAGS) -o $@ $^ $(LIBS) $(CFLAGS)
 
 $(OBJ): config.h Makefile $(LDIR)/libluajit.a | $(ODIR)
 
