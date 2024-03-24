@@ -7,6 +7,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "atomicvar.h"
 #include "wrk.h"
 #include "script.h"
 #include "main.h"
@@ -20,6 +21,7 @@ static struct config {
     uint64_t threads;
     uint64_t connections;
     uint64_t duration;
+    uint64_t count;
     uint64_t timeout;
     uint64_t pipeline;
     uint64_t rate;
@@ -69,6 +71,7 @@ static void usage() {
            "  Options:                                            \n"
            "    -c, --connections <N>  Connections to keep open   \n"
            "    -d, --duration    <T>  Duration of test           \n"
+           "    -n, --count       <N>  Number of requests sent    \n"
            "    -t, --threads     <N>  Number of threads to use   \n"
            "                                                      \n"
            "    -s, --script      <S>  Load Lua script file       \n"
@@ -140,17 +143,20 @@ int main(int argc, char **argv) {
         exit(1);
     }
 
+    uint64_t guess_duration = cfg.duration > 0 ? cfg.duration : 10000;
     num_spot_observations = 0
       + ((CALIBRATE_DELAY_MS + (cfg.connections * 5)) / DUMP_INTERVAL_MS)
       + ((TIMEOUT_INTERVAL_MS + (cfg.connections * 5)) / DUMP_INTERVAL_MS)
-      + 2*(((uint64_t)cfg.duration * 1000) / DUMP_INTERVAL_MS)
+      + 2*(((uint64_t)guess_duration * 1000) / DUMP_INTERVAL_MS)
       + 5;
+
     spot_observations = (spot_observation *)zcalloc(num_spot_observations * sizeof(spot_observation));
     n_spot_observations = 0;
     
     uint64_t connections = cfg.connections / cfg.threads;
     double throughput    = (double)cfg.rate / cfg.threads;
-    uint64_t stop_at     = time_us() + (cfg.duration * 1*1000*1000);
+    uint64_t stop_at;
+    stop_at = time_us() + (guess_duration * 1*1000*1000);
 
     for (uint64_t i = 0; i < (cfg.threads + 1); i++) {
         thread *t = &threads[i];
@@ -186,8 +192,12 @@ int main(int argc, char **argv) {
     sigfillset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
 
-    char *time = format_time_s(cfg.duration);
-    printf("Running %s test @ %s\n", time, url);
+    if (cfg.duration > 0) {
+        char *time = format_time_s(cfg.duration);
+        printf("Running %s test @ %s\n", time, url);
+    } else {
+        printf("Running %" PRId64 " iterations of test @ %s\n", cfg.count, url);
+    }
     printf("  %"PRIu64" threads and %"PRIu64" connections\n",
             cfg.threads, cfg.connections);
 
@@ -586,7 +596,7 @@ static int response_complete(http_parser *parser) {
         c->state = FIELD;
     }
 
-    if (now >= thread->stop_at) {
+    if (stop || now >= thread->stop_at) {
         aeStop(thread->loop);
         goto done;
     }
@@ -680,11 +690,18 @@ static void socket_connected(aeEventLoop *loop, int fd, void *data, int mask) {
 
 }
 
+static uint64_t req_sent = 0;
+
 static void socket_writeable(aeEventLoop *loop, int fd, void *data, int mask) {
     connection *c = data;
     thread *thread = c->thread;
 
     if (!c->written) {
+        uint64_t old_req_sent;
+        atomicGetIncr(req_sent, old_req_sent, 1);
+        if (old_req_sent > cfg.count) {
+          stop = 1;
+        }
         uint64_t time_usec_to_wait = usec_to_next_send(c);
         if (time_usec_to_wait) {
             int msec_to_wait = round((time_usec_to_wait / 1000.0L) + 0.5);
@@ -779,8 +796,9 @@ static char *copy_url_part(char *url, struct http_parser_url *parts, enum http_p
 
 static struct option longopts[] = {
     { "connections",    required_argument, NULL, 'c' },
-    { "duration",       required_argument, NULL, 'd' },
     { "threads",        required_argument, NULL, 't' },
+    { "duration",       required_argument, NULL, 'd' },
+    { "count",          required_argument, NULL, 'n' },
     { "script",         required_argument, NULL, 's' },
     { "header",         required_argument, NULL, 'H' },
     { "latency",        no_argument,       NULL, 'L' },
@@ -799,18 +817,21 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
     memset(cfg, 0, sizeof(struct config));
     cfg->threads     = 2;
     cfg->connections = 10;
-    cfg->duration    = 10;
+    cfg->duration    = 0;
     cfg->timeout     = SOCKET_TIMEOUT_MS;
     cfg->rate        = 0;
     cfg->record_all_responses = true;
 
-    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:R:LUBrv?", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "t:c:d:n:s:H:T:R:LUBrv?", longopts, NULL)) != -1) {
         switch (c) {
             case 't':
                 if (scan_metric(optarg, &cfg->threads)) return -1;
                 break;
             case 'c':
                 if (scan_metric(optarg, &cfg->connections)) return -1;
+                break;
+            case 'n':
+                if (scan_metric(optarg, &cfg->count)) return -1;
                 break;
             case 'd':
                 if (scan_time(optarg, &cfg->duration)) return -1;
@@ -850,7 +871,11 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
         }
     }
 
-    if (optind == argc || !cfg->threads || !cfg->duration) return -1;
+    if (optind == argc || !cfg->threads || !((cfg->duration!=0) ^ (cfg->count!=0))) {
+        fprintf(stderr,
+            "invocation needs --threads and one of --duration or --count \n");
+        return -1;
+    }
 
     if (!script_parse_url(argv[optind], parts)) {
         fprintf(stderr, "invalid URL: %s\n", argv[optind]);
